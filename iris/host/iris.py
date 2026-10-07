@@ -161,6 +161,9 @@ class Iris:
         if self._sdma_ep is not None:
             self._init_copy_engines(num_gpus, num_ranks, cur_rank)
 
+        # Chains armed by iris.triggered plans on the host queues, per peer
+        self._triggered_ledger = None
+
         # Initialize CCL interface
         self.ccl = self.CCL(self)
 
@@ -1113,6 +1116,7 @@ class Iris:
         if to_tensor is None:
             to_tensor = from_tensor
 
+        self._check_host_queue_idle(to_rank)
         from_rank = self.get_rank()
         from_ptr = from_tensor.data_ptr()
         to_ptr = self.heap.translate(to_tensor.data_ptr(), from_rank, to_rank)
@@ -1195,6 +1199,7 @@ class Iris:
 
         """
         sdma_ep = self._require_copy_engine()
+        self._check_host_queue_idle(to_rank)
         from_rank = self.get_rank()
 
         wait_ptr, wait_bits = self._flag_pointer_and_bits(wait_flag, default_bits=32)
@@ -1316,6 +1321,7 @@ class Iris:
             channel: SDMA channel to use
         """
         sdma_ep = self._require_copy_engine()
+        self._check_host_queue_idle(to_rank)
         from_rank = self.get_rank()
 
         if not (
@@ -1432,11 +1438,18 @@ class Iris:
         sdma_ep = self._require_copy_engine()
         src_rank = self.get_rank()
         if to_rank is not None:
+            self._check_host_queue_idle(to_rank)
             sdma_ep.quiet(src_rank, to_rank, channel)
         else:
             # Quiet to all ranks
             for rank in range(self.get_num_ranks()):
+                self._check_host_queue_idle(rank)
                 sdma_ep.quiet(src_rank, rank, channel)
+
+    def _check_host_queue_idle(self, to_rank):
+        # Chains parked on a host queue block everything queued behind them, quiet() included
+        if self._triggered_ledger is not None:
+            self._triggered_ledger.check_idle(to_rank)
 
     def allocate_symmetric(self, *size, dtype=None) -> tuple[torch.Tensor, torch.Tensor]:
         """
