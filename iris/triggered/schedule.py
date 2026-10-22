@@ -9,7 +9,10 @@ batch is one gate: once it has received ``contributors`` publishes, the copy eng
 segment of the batch to each peer and signals the batch's arrival there.
 
 Chains on one copy-engine queue run strictly in arming order, so a batch completed early waits for
-every batch armed before it. Order the schedule the way the producer finishes its work.
+every batch armed before it on the same queue. Order the schedule the way the producer finishes its
+work. A batch's ``lane`` picks the host queue its chains run on (one per lane and peer): chains on
+different lanes do not wait for each other. Lane 0 is the default; more lanes need ``sdma_lanes`` on
+the Iris context.
 """
 
 from dataclasses import dataclass
@@ -41,10 +44,17 @@ class Segment:
 
 @dataclass(frozen=True)
 class Batch:
-    """A group of segments behind one gate, complete after ``contributors`` publishes per epoch."""
+    """
+    A group of segments behind one gate, complete after ``contributors`` publishes per epoch.
+
+    ``lane`` selects which of the context's ``sdma_lanes`` lanes carries the batch's chains: batches on
+    one lane are released in arming order, lanes are independent of each other. A lane is not a route:
+    see ``iris.triggered.queues`` for how lanes, channels and dependency classes differ.
+    """
 
     segments: tuple
     contributors: int = 1
+    lane: int = 0
 
     @property
     def is_2d(self):
@@ -125,13 +135,21 @@ def waves(view, block_shape, num_programs, order=None, base=None):
     return batches
 
 
-def validate(schedule, buffer_bytes):
-    """Check every batch of ``schedule`` fits a buffer of ``buffer_bytes`` and can be encoded."""
+def validate(schedule, buffer_bytes, lanes=1):
+    """
+    Check every batch of ``schedule`` fits a buffer of ``buffer_bytes``, can be encoded and sits on
+    one of the ``lanes`` lanes.
+    """
     for i, batch in enumerate(schedule):
         if not batch.segments:
             raise ValueError(f"batch {i} has no segments")
         if batch.contributors < 1:
             raise ValueError(f"batch {i} needs at least one contributor")
+        if not isinstance(batch.lane, int) or isinstance(batch.lane, bool) or not 0 <= batch.lane < lanes:
+            raise ValueError(
+                f"batch {i}: lane {batch.lane!r} is not one of the {lanes} lane(s) of this context "
+                "(create it with sdma_lanes=N to use lanes 0..N-1)"
+            )
         for s in batch.segments:
             if s.width <= 0 or s.height <= 0 or s.offset < 0:
                 raise ValueError(f"batch {i}: empty or negative segment {s}")

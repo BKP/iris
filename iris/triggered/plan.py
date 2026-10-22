@@ -13,9 +13,11 @@ Lifecycle:
     plan.next_epoch()                               # barrier -> re-arm -> barrier
     plan.destroy()
 
-All of a rank's chains to one peer share that peer's host-initiated copy-engine queue, and run in
-the order they were armed. Plans armed on the same queues must therefore be released in the order
-they were armed, and nothing else may use those queues while chains are armed on them.
+All of a rank's chains to one peer on one lane share that lane's host-initiated copy-engine queue,
+and run in the order they were armed. Plans armed on the same queues must therefore be released in
+the order they were armed, and nothing else may use those queues while chains are armed on them.
+Batches default to lane 0; ``Batch.lane`` puts a batch on another of the context's ``sdma_lanes``
+lanes, each on its own host queue, and lanes do not wait for each other.
 """
 
 import enum
@@ -30,6 +32,7 @@ from iris.host.distributed.helpers import distributed_allgather
 from iris.host.memory.allocators.torch_allocator import TorchAllocator
 from iris.mem.triton import triggered as dv
 from iris.triggered import armer, kernels
+from iris.triggered.queues import queue_index
 from iris.triggered.schedule import validate
 
 UINT32_MAX = (1 << 32) - 1
@@ -45,43 +48,57 @@ class State(enum.Enum):
     DESTROYED = "destroyed"
 
 
+def _queue_name(peer, queue):
+    return f"queue to rank {peer}" + (f" (host queue {queue})" if queue else "")
+
+
 class _QueueLedger:
-    """What is armed on each of this process's host queues, in arming order."""
+    """
+    What is armed on each of this process's host queues, in arming order.
+
+    A queue is one host queue to one peer, keyed ``(peer, queue)`` with ``queue`` the index rocm-xio
+    calls a channel (see ``iris.triggered.queues``). Each queue has its own ring, so its byte budget
+    is its own. A lane runs on the queue ``queue_index(lane)``.
+    """
 
     def __init__(self, capacity):
         self.capacity = capacity
-        self.entries = defaultdict(list)  # peer -> [(plan, epoch, nbytes)]
+        self.entries = defaultdict(list)  # (peer, queue) -> [(plan, epoch, nbytes)]
 
     def reserve(self, plan, epoch, nbytes):
-        for peer, n in nbytes.items():
-            used = sum(e[2] for e in self.entries[peer])
+        """Reserve ``nbytes``, a dict ``{(peer, queue): bytes}``, or raise if any queue would overflow."""
+        for (peer, queue), n in nbytes.items():
+            used = sum(e[2] for e in self.entries[(peer, queue)])
             if used + n > self.capacity:
                 raise RuntimeError(
-                    f"arming {n} bytes on the queue to rank {peer} would exceed {self.capacity} armed bytes "
+                    f"arming {n} bytes on the {_queue_name(peer, queue)} would exceed {self.capacity} armed bytes "
                     f"({used} already armed); complete or destroy other plans first"
                 )
-        for peer, n in nbytes.items():
-            self.entries[peer].append((plan, epoch, n))
+        for key, n in nbytes.items():
+            self.entries[key].append((plan, epoch, n))
 
     def release(self, plan):
-        for peer in self.entries:
-            self.entries[peer] = [e for e in self.entries[peer] if e[0] is not plan]
+        for key in self.entries:
+            self.entries[key] = [e for e in self.entries[key] if e[0] is not plan]
 
     def check_order(self, plan, allowed, action):
-        for peer, entries in self.entries.items():
+        for (peer, queue), entries in self.entries.items():
+            if not any(e[0] is plan for e in entries):
+                continue  # nothing of this plan is queued there: its order does not matter to it
             for other, epoch, _ in entries:
                 if other is plan:
                     break
                 if other.state not in allowed:
                     raise RuntimeError(
-                        f"plan armed earlier on the queue to rank {peer} (epoch {epoch}) is {other.state.value}; "
+                        f"plan armed earlier on the {_queue_name(peer, queue)} (epoch {epoch}) is {other.state.value}; "
                         f"plans sharing queues must {action} in the order they were armed"
                     )
 
-    def check_idle(self, peer):
-        if self.entries.get(peer):
+    def check_idle(self, peer, queue=0):
+        """Refuse host copy-engine work on host queue ``queue`` to ``peer`` while triggered chains are armed on it."""
+        if self.entries.get((peer, queue)):
             raise RuntimeError(
-                f"triggered chains are armed on the copy-engine queue to rank {peer}; "
+                f"triggered chains are armed on the copy-engine {_queue_name(peer, queue)}; "
                 "complete, abort or destroy those plans before using it"
             )
 
@@ -131,7 +148,9 @@ class TriggeredPlan:
         ctx: Iris instance.
         buffer: Contiguous tensor on the symmetric heap. The heap must keep peer mappings stable while
             chains are armed, which rules out the default torch allocator: use ``allocator_type="vmem_chunked"`` (or ``"vmem"``).
-        schedules: One list of ``Batch`` per rank, each in the order that rank completes them.
+        schedules: One list of ``Batch`` per rank, each in the order that rank completes them. Batches
+            on different lanes (``Batch.lane``; the context needs ``sdma_lanes`` above 1) do not wait for
+            each other.
         timeout: Seconds ``end_device_epoch()`` waits before raising.
     """
 
@@ -153,7 +172,7 @@ class TriggeredPlan:
         buffer_bytes = buffer.numel() * buffer.element_size()
         if len(schedules) != self.world_size:
             raise ValueError(f"need one schedule per rank ({self.world_size}), got {len(schedules)}")
-        self.schedules = [list(validate(s, buffer_bytes)) for s in schedules]
+        self.schedules = [list(validate(s, buffer_bytes, lanes=ctx.sdma_lanes)) for s in schedules]
         digests = distributed_allgather(_digest(buffer_bytes, self.schedules))
         if not (digests == digests[0]).all():
             raise ValueError("ranks passed different buffers sizes or schedules")
@@ -162,6 +181,8 @@ class TriggeredPlan:
         self.num_batches = self._first[-1]
         if self.num_batches == 0:
             raise ValueError("schedules contain no batches")
+        # Lanes the plan's batches use; the schedules (hence this) are the same on every rank
+        self.lanes = 1 + max(b.lane for s in self.schedules for b in s)
 
         self.buffer = buffer
         self.gates = ctx.zeros(self.num_batches, dv.GATE_WORDS.value, dtype=torch.int64)
@@ -191,8 +212,12 @@ class TriggeredPlan:
             raise RuntimeError("epoch exceeds 32 bits; destroy the plan and create a new one")
         peers = [p for p in range(self.world_size) if p != self.rank]
         own = self.schedules[self.rank]
-        nbytes = sum(armer.chain_bytes(self._sdma_ep, b) for b in own)
-        self._ledger.reserve(self, epoch, {p: nbytes for p in peers})
+        lane_bytes = armer.chain_bytes_by_lane(self._sdma_ep, own)
+        self._ledger.reserve(
+            self,
+            epoch,
+            {(p, queue_index(lane)): n for p in peers for lane, n in lane_bytes.items()},
+        )
         self.epoch = epoch
         self.state = State.ARMED
 
@@ -215,7 +240,17 @@ class TriggeredPlan:
                         for s in batch.segments
                     ]
                     arrival = heap.translate(gate + 8 * dv.G_ARRIVAL.value, self.rank, peer)
-                    armer.arm_chain(self._sdma_ep, self.rank, peer, gate, self.epoch, copies, arrival, batch.is_2d)
+                    armer.arm_chain(
+                        self._sdma_ep,
+                        self.rank,
+                        peer,
+                        gate,
+                        self.epoch,
+                        copies,
+                        arrival,
+                        batch.is_2d,
+                        channel=queue_index(batch.lane),
+                    )
         except Exception:
             # Chains armed so far stay parked: abort() releases them
             self.state = State.FAILED

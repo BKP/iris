@@ -93,6 +93,28 @@ tl.atomic_xchg(ready, epoch, sem="release", scope="sys")
 **Consumer.** `arrived` / `wait` read the arrival gate with an acquire at system scope; data read
 after it in the same kernel is fresh (no stale elements over 9,600 tile-epochs).
 
+## Lanes
+
+Chains to one peer run in the order they were armed, so a batch whose gate opens early waits behind
+every earlier batch whose gate has not. A **lane** is an independent ordered queue to a peer: batches
+on different lanes do not wait for each other, batches on one lane keep arming order. Create the
+context with `sdma_lanes=N` and set `Batch.lane` (0 to N − 1, default 0) on each batch:
+
+```python
+ctx = iris.iris(heap_size, allocator_type="vmem_chunked", engines=("sdma",), sdma_lanes=2)
+schedule = [Batch(segments_a, lane=0), Batch(segments_b, lane=1)]
+```
+
+Each lane runs on its own host queue to each peer. A host `put(..., channel=q)` names a queue by
+index (`channel` is rocm-xio's word for it); lane `i` uses queue `i`, so the put is refused
+while a plan has chains armed on that queue, and unaffected by chains on the others. Every rank
+must give the same lane to each batch (the schedule check covers it). All lanes to one peer share a
+copy engine, so lanes remove blocking but add no bandwidth. With the default single lane, behavior
+is unchanged.
+
+A lane is only an ordered queue. It is not a route or a share of a collective's tiles, and it does
+not say which work must never share a queue.
+
 ## Gates and epochs
 
 - Each batch has a 64-byte gate row: `ready`, `arrival`, `completion` (64-bit), `error`, and a
@@ -111,10 +133,11 @@ after it in the same kernel is fresh (no stale elements over 9,600 tile-epochs).
   both keep peer addresses fixed, and the chunked allocator maps new chunks into each peer's
   reserved range as the heap grows. The default torch allocator re-maps peer heaps on every
   allocation and is rejected.
-- **One queue per peer.** Plans use the host-initiated copy-engine queue to each peer, shared with
-  host `Iris.put()`. Kernel-initiated copies (`put(..., use_copy_engine=True)`) use a separate
-  queue and are unaffected.
-- **Ring capacity.** Armed chains may use at most half of each queue's 8 MiB ring.
+- **One queue per peer and lane.** Plans use the host-initiated copy-engine queue to each peer
+  (one per lane, see [Lanes](#lanes)), shared with host `Iris.put()` on the same queue.
+  Kernel-initiated copies (`put(..., use_copy_engine=True)`) use a separate queue and are unaffected.
+- **Ring capacity.** Armed chains may use at most half of each queue's 8 MiB ring; each lane has its
+  own ring and its own budget.
 - **Single node only.**
 - **Linear segments are at most 1 GiB** (SDMA 4.4's count field is 30 bits). The schedule builders
   split larger ranges.

@@ -27,6 +27,14 @@ def chain_bytes(sdma_ep, batch):
     return POLL_REGMEM_BYTES + len(batch.segments) * copy_bytes + sdma_ep.ATOMIC_COMMAND_BYTES
 
 
+def chain_bytes_by_lane(sdma_ep, batches):
+    """Bytes the chains of ``batches`` occupy on the queue to one peer, per lane: ``{lane: bytes}``."""
+    totals = {}
+    for batch in batches:
+        totals[batch.lane] = totals.get(batch.lane, 0) + chain_bytes(sdma_ep, batch)
+    return totals
+
+
 def arm_chain(sdma_ep, src_device, dst_device, ready_addr, epoch, copies, arrival_addr, is_2d, channel=CHANNEL):
     """Arm one chain on the host queue from ``src_device`` to ``dst_device``."""
     if is_2d:

@@ -45,7 +45,7 @@ def make_ctx():
     ctx = SimpleNamespace(
         get_rank=lambda: 0,
         _require_copy_engine=lambda: ep,
-        _check_host_queue_idle=lambda rank: None,
+        _check_host_queue_idle=lambda rank, channel=0: None,
         heap=SimpleNamespace(translate=lambda ptr, src_rank, dst_rank: ptr + REMOTE),
     )
     ctx._flag_pointer_and_bits = lambda flag, **kw: Iris._flag_pointer_and_bits(ctx, flag, **kw)
@@ -99,7 +99,7 @@ def test_put_tiles_takes_raw_arguments():
 def assert_refused_while_triggered_chains_are_armed(call):
     ctx, ep = make_ctx()
 
-    def busy(rank):
+    def busy(rank, channel=0):
         raise RuntimeError(f"triggered chains are armed on the copy-engine queue to rank {rank}")
 
     ctx._check_host_queue_idle = busy
