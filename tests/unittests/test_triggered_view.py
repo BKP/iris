@@ -63,3 +63,34 @@ def test_arrived_reads_ready_for_own_batches_and_arrival_for_others():
     gates[1, dv.G_READY.value] = 3
     _arrived_kernel[(1,)](view, out, 2)
     assert out.tolist() == [1, 1]
+
+
+@triton.jit
+def _failed_kernel(view, out, n):
+    tv = TriggeredView.initialize(view)
+    for b in range(n):
+        tl.store(out + b, tv.failed(b).to(tl.int32))
+
+
+def test_failed_reads_the_error_word_for_this_epoch():
+    one = [Batch((Segment(0, 64),))]
+    view, gates = _view(0, [one, one], epoch=3)
+    out = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    # Nothing writes the error word: no batch has failed
+    _failed_kernel[(1,)](view, out, 2)
+    assert out.tolist() == [0, 0]
+
+    # An error from an earlier epoch is not a failure of this one; this epoch or a later one is
+    gates[0, dv.G_ERROR.value] = 2
+    gates[1, dv.G_ERROR.value] = 3
+    _failed_kernel[(1,)](view, out, 2)
+    assert out.tolist() == [0, 1]
+
+    # Other gate words do not mean failure
+    gates.zero_()
+    gates[:, dv.G_READY.value] = 3
+    gates[:, dv.G_ARRIVAL.value] = 3
+    gates[:, dv.G_COMPLETION.value] = 3
+    _failed_kernel[(1,)](view, out, 2)
+    assert out.tolist() == [0, 0]

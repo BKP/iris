@@ -24,6 +24,7 @@ import enum
 import hashlib
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -51,6 +52,39 @@ class State(enum.Enum):
 
 def _queue_name(peer, queue):
     return f"queue to rank {peer}" + (f" (host queue {queue})" if queue else "")
+
+
+@dataclass(frozen=True)
+class BatchFailure:
+    """
+    One batch that did not complete in time, as this rank saw it: ``batch`` (global id), ``owner`` rank, and
+    ``reason``, one of ``"unpublished"`` (the owner never released it; owner only), ``"not arrived at peers"``
+    (released, but ``peers`` have not received it; owner only) or ``"not arrived here"`` (this rank is a
+    destination and it has not arrived).
+    """
+
+    batch: int
+    owner: int
+    reason: str
+    peers: tuple = ()
+
+
+class PlanError(TimeoutError):
+    """
+    The epoch did not complete in time. ``failures`` lists every incomplete batch this rank is part of (see
+    ``BatchFailure``). Each rank reports what it observed: it also stores the epoch in the ``G_ERROR`` word of
+    those batches' gates, so a kernel on this rank sees ``TriggeredView.failed(batch)`` become true. Peers learn of
+    a failure from their own timeout, not from this rank.
+    """
+
+    def __init__(self, epoch, failures):
+        self.epoch, self.failures = epoch, failures
+        ids = [f.batch for f in failures]
+        shown = "; ".join(
+            f"batch {f.batch} (rank {f.owner}) {f.reason}" + (f" {list(f.peers)}" if f.peers else "")
+            for f in failures[:8]
+        )
+        super().__init__(f"epoch {epoch}: batches {ids[:16]} not complete: {shown}")
 
 
 class _QueueLedger:
@@ -212,6 +246,8 @@ class TriggeredPlan:
             self._first[self.rank], self._first[self.rank + 1], dtype=torch.int64, device=buffer.device
         )
         self._status = torch.zeros(self.num_batches, dtype=torch.int32, device=buffer.device)
+        self._missing = torch.zeros(self.num_batches, dtype=torch.int64, device=buffer.device)
+        self.failures = []
         self._ledger = ledger(ctx)
         self.epoch = 0
         self._arm(1)
@@ -287,23 +323,43 @@ class TriggeredPlan:
 
     def _wait(self, own_only, timeout):
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        done = kernels.STATUS_DONE.value
         while True:
             kernels.progress_kernel[(self.num_batches,)](
                 self.view,
                 self.ctx.get_heap_bases(),
                 self._status,
+                self._missing,
                 BUDGET=_PROGRESS_BUDGET,
                 WORLD_SIZE=self.world_size,
                 OWN_ONLY=own_only,
             )
             status = self._status.cpu()
             mine = slice(self._first[self.rank], self._first[self.rank + 1])
-            pending = (status[mine] if own_only else status) == 0
+            pending = ((status[mine] if own_only else status) & done) == 0
             if not pending.any():
                 return
             if time.monotonic() > deadline:
-                missing = (pending.nonzero().flatten() + (mine.start if own_only else 0)).tolist()
-                raise TimeoutError(f"epoch {self.epoch}: batches {missing[:16]} not complete")
+                first = mine.start if own_only else 0
+                ids = (pending.nonzero().flatten() + first).tolist()
+                self._fail(ids, status, self._missing.cpu())
+
+    def _fail(self, ids, status, missing):
+        """Record why each batch in ``ids`` is incomplete, flag it in its gate's error word, and raise."""
+        owner_of = np.searchsorted(self._first, ids, side="right") - 1
+        failures = []
+        for b, owner in zip(ids, owner_of.tolist()):
+            flags, absent = int(status[b]), int(missing[b])
+            if flags & kernels.STATUS_UNPUBLISHED.value:
+                failures.append(BatchFailure(b, owner, "unpublished"))
+            elif flags & kernels.STATUS_NOT_HERE.value:
+                failures.append(BatchFailure(b, owner, "not arrived here"))
+            else:
+                peers = tuple(r for r in range(self.world_size) if absent >> r & 1)
+                failures.append(BatchFailure(b, owner, "not arrived at peers", peers))
+        self.gates[torch.tensor(ids, device=self.gates.device), dv.G_ERROR.value] = self.epoch
+        self.failures = failures
+        raise PlanError(self.epoch, failures)
 
     def end_device_epoch(self, timeout=None):
         """Wait until every batch is complete this epoch: own ones arrived at every peer, others here."""

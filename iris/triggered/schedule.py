@@ -49,7 +49,7 @@ class Batch:
 
     ``lane`` selects which of the context's ``sdma_lanes`` lanes carries the batch's chains: batches on
     one lane are released in arming order, lanes are independent of each other. A lane is not a route:
-    see ``iris.triggered.queues`` for how lanes, channels and dependency classes differ.
+    see ``iris.triggered.queues`` for how lanes and rocm-xio channels differ.
 
     ``peers`` lists the ranks that receive the batch; ``None`` (the default) means every other rank. A
     batch for one rank only (scatter) or one that only the root receives (gather) sets it.

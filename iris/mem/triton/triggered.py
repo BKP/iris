@@ -142,3 +142,16 @@ class TriggeredView:
         """True once batch ``batch`` is complete this epoch (set by ``end_device_epoch()``)."""
         gate = self.gates + batch * GATE_WORDS
         return tl.atomic_add(gate + G_COMPLETION, 0, sem="acquire", scope="sys") >= self.epoch
+
+    @triton.jit
+    def failed(self, batch):
+        """
+        True once batch ``batch`` has been marked failed this epoch: its ``G_ERROR`` word holds this
+        epoch or a later one.
+
+        When an epoch times out, the plan stores the failing epoch in the error word of every batch that
+        did not complete, so a kernel can poll this instead of spinning forever. Call uniformly across the
+        CTA, like ``arrived``.
+        """
+        gate = self.gates + batch * GATE_WORDS
+        return tl.atomic_add(gate + G_ERROR, 0, sem="acquire", scope="sys") >= self.epoch
