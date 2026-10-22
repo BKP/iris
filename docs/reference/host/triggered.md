@@ -19,6 +19,12 @@ Pre-armed copy-engine transfers released by kernels. See
 .. autofunction:: iris.triggered.tiles
 ```
 
+## Failures
+```{eval-rst}
+.. autoclass:: iris.triggered.PlanError
+.. autoclass:: iris.triggered.BatchFailure
+```
+
 ## Collectives
 ```{eval-rst}
 .. autofunction:: iris.triggered.allgather
@@ -32,5 +38,5 @@ The same builders are available as `ctx.triggered.allgather(...)`, `.scatter(...
 ## TriggeredView (device)
 ```{eval-rst}
 .. autoclass:: iris.triggered.TriggeredView
-   :members: initialize, publish, arrived, wait, reusable, can_publish, can_consume
+   :members: initialize, publish, arrived, wait, reusable, failed, can_publish, can_consume
 ```

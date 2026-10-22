@@ -59,7 +59,7 @@ plan.destroy()
    contributes to.** Its wait could depend on a chain parked behind one of its own unpublished
    batches.
 4. **Segment sizes are fixed when the plan is created.**
-5. **`arrived`, `wait` and `reusable` are called uniformly across the CTA:** every wave makes the
+5. **`arrived`, `wait`, `reusable` and `failed` are called uniformly across the CTA:** every wave makes the
    same number of calls. Each is one atomic whose result reaches the other waves through a CTA
    barrier, so a polling loop must not exit on a per-wave condition (such as a clock read):
    waves would read the result before it is written, or deadlock. Count polls instead.
@@ -119,10 +119,23 @@ not say which work must never share a queue.
 
 - Each batch has a 64-byte gate row: `ready`, `arrival`, `completion` (64-bit), `error`, and a
   contributor counter. The copy engine polls the low 32 bits of `ready` with `>=`.
+- `failed(batch)` reads the `error` word and is true once it holds this epoch or a later one. It is only
+  meaningful once the epoch has begun (the view's epoch is 0 before that). See [Failures](#failures).
 - Epochs start at 1 and add 1 per `next_epoch()`. Gates are never reset, so a plan is limited to
   2³² − 1 epochs.
 - `end_device_epoch()` checks completion with a kernel: this rank's batches published and arrived
   at every peer (each chain ends with that signal), and every other batch arrived here.
+
+## Failures
+
+If `end_device_epoch()` (or `abort()`) is not done within its timeout, it raises `PlanError`, a
+`TimeoutError`. `PlanError.failures` (also `plan.failures`) lists a `BatchFailure(batch, owner, reason,
+peers)` for each incomplete batch this rank is part of: `"unpublished"` (the owner never released
+it), `"not arrived at peers"` (released, but `peers` have not received it) or `"not arrived here"`.
+The epoch is also stored in the `error` word of those gates, so a kernel on this rank sees
+`failed(batch)` turn true. Each rank reports what it observed; a peer learns of a failure from its own
+timeout. A failed plan can only be aborted and destroyed. Note that a peer's `abort()` releases and
+completes its batches, so ranks that want to compare what they saw must synchronize before aborting.
 
 ## Requirements and limits
 
