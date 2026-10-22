@@ -141,3 +141,24 @@ not say which work must never share a queue.
 - **Single node only.**
 - **Linear segments are at most 1 GiB** (SDMA 4.4's count field is 30 bits). The schedule builders
   split larger ranges.
+
+## Direct collectives
+
+`ctx.triggered.allgather(buffer, tile_shape)`, `.scatter(buffer, root, tile_shape)` and `.gather(buffer, root, tile_shape)`
+return ordinary plans. `buffer` is a symmetric 2D tensor of `world_size` equal row slices; rank `r`'s slice is where
+rank `r` keeps its data and where everyone else receives it. Each slice is cut into tiles (`tiles(view, tile_shape)`),
+one batch per tile, and each batch carries the set of ranks that receive it (`Batch.peers`; `None` means every other rank).
+
+| Collective | Publishes | Receives |
+|---|---|---|
+| all-gather | every rank, its own slice | every other rank |
+| scatter | the root, every other rank's slice | rank `r`, its own slice |
+| gather | every rank but the root, its own slice | the root |
+| broadcast | the root, the whole buffer (no slicing) | every other rank |
+| all-to-all | every rank, its row of blocks | block `(r, j)` goes to rank `j` |
+
+All-to-all takes `world_size ** 2` equal blocks laid out `[source][destination]`; data lands at the same offset as the sender holds it.
+
+A kernel asks `can_publish(tile)` and `can_consume(tile)` instead of assuming a role: it publishes the tiles it owns and
+polls `arrived(tile)` (with a spin budget) for the tiles it receives. `examples/34_triggered_collectives` is a complete
+kernel; the limit is 63 ranks because destinations travel as a 64-bit mask. Tiles are single-hop (no relay).

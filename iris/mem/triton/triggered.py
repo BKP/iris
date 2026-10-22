@@ -10,6 +10,10 @@ A kernel opens the gate with ``publish`` and observes arrivals with ``arrived`` 
 
 View layout (int64 words): an 8-word header, then one 4-word record per batch. Gate table: one
 64-byte row per batch.
+
+A batch goes to every other rank, or to the subset of ranks in its ``peers`` bitmask (``R_PEERS``: bit
+``r`` set means rank ``r`` receives it). A rank's role for a batch is PUBLISH for the owner, CONSUME for
+a receiving rank and none otherwise; only a rank with a role may publish or wait for the batch.
 """
 
 import triton
@@ -34,6 +38,7 @@ RECORD_WORDS = tl.constexpr(4)
 R_ROLE = tl.constexpr(0)
 R_CONTRIBUTORS = tl.constexpr(1)
 R_OWNER = tl.constexpr(2)
+R_PEERS = tl.constexpr(3)  # bit r set: rank r receives the batch (so at most 63 ranks)
 
 ROLE_PUBLISH = tl.constexpr(1)
 ROLE_CONSUME = tl.constexpr(2)
