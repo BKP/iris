@@ -16,7 +16,18 @@ Pre-armed copy-engine transfers released by kernels. See
 .. autofunction:: iris.triggered.whole
 .. autofunction:: iris.triggered.chunks
 .. autofunction:: iris.triggered.waves
+.. autofunction:: iris.triggered.tiles
 ```
+
+## Collectives
+```{eval-rst}
+.. autofunction:: iris.triggered.allgather
+.. autofunction:: iris.triggered.scatter
+.. autofunction:: iris.triggered.gather
+.. autofunction:: iris.triggered.broadcast
+.. autofunction:: iris.triggered.alltoall
+```
+The same builders are available as `ctx.triggered.allgather(...)`, `.scatter(...)`, `.gather(...)`.
 
 ## TriggeredView (device)
 ```{eval-rst}

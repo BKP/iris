@@ -9,7 +9,23 @@ Device side: ``TriggeredView`` (``publish``, ``arrived``, ``wait``).
 """
 
 from iris.mem.triton.triggered import TriggeredView
+from iris.triggered.collectives import allgather, alltoall, broadcast, gather, scatter
 from iris.triggered.plan import State, TriggeredPlan
-from iris.triggered.schedule import Batch, Segment, chunks, waves, whole
+from iris.triggered.schedule import Batch, Segment, chunks, tiles, waves, whole
 
-__all__ = ["TriggeredPlan", "TriggeredView", "State", "Batch", "Segment", "whole", "chunks", "waves"]
+__all__ = [
+    "TriggeredPlan",
+    "TriggeredView",
+    "State",
+    "Batch",
+    "Segment",
+    "whole",
+    "chunks",
+    "waves",
+    "tiles",
+    "allgather",
+    "scatter",
+    "gather",
+    "broadcast",
+    "alltoall",
+]

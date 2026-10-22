@@ -33,9 +33,10 @@ from iris.host.memory.allocators.torch_allocator import TorchAllocator
 from iris.mem.triton import triggered as dv
 from iris.triggered import armer, kernels
 from iris.triggered.queues import queue_index
-from iris.triggered.schedule import validate
+from iris.triggered.schedule import destinations, validate
 
 UINT32_MAX = (1 << 32) - 1
+_MAX_RANKS = 63
 _PROGRESS_BUDGET = 100_000
 
 
@@ -127,9 +128,17 @@ def view_words(rank, world_size, gates_ptr, schedules):
     rec = dv.HEADER_WORDS.value
     for owner, schedule in enumerate(schedules):
         for batch in schedule:
-            words[rec + dv.R_ROLE.value] = dv.ROLE_PUBLISH.value if owner == rank else dv.ROLE_CONSUME.value
+            peers = destinations(batch, owner, world_size)
+            if owner == rank:
+                role = dv.ROLE_PUBLISH.value
+            elif rank in peers:
+                role = dv.ROLE_CONSUME.value
+            else:
+                role = 0  # not this rank's batch: it neither publishes nor waits for it
+            words[rec + dv.R_ROLE.value] = role
             words[rec + dv.R_CONTRIBUTORS.value] = batch.contributors
             words[rec + dv.R_OWNER.value] = owner
+            words[rec + dv.R_PEERS.value] = sum(1 << p for p in peers)
             rec += dv.RECORD_WORDS.value
     return words
 
@@ -172,7 +181,12 @@ class TriggeredPlan:
         buffer_bytes = buffer.numel() * buffer.element_size()
         if len(schedules) != self.world_size:
             raise ValueError(f"need one schedule per rank ({self.world_size}), got {len(schedules)}")
-        self.schedules = [list(validate(s, buffer_bytes, lanes=ctx.sdma_lanes)) for s in schedules]
+        if self.world_size > _MAX_RANKS:
+            raise ValueError(f"a plan supports at most {_MAX_RANKS} ranks (batch destinations are a 64-bit mask)")
+        self.schedules = [
+            list(validate(s, buffer_bytes, lanes=ctx.sdma_lanes, owner=r, world_size=self.world_size))
+            for r, s in enumerate(schedules)
+        ]
         digests = distributed_allgather(_digest(buffer_bytes, self.schedules))
         if not (digests == digests[0]).all():
             raise ValueError("ranks passed different buffers sizes or schedules")
@@ -210,14 +224,14 @@ class TriggeredPlan:
     def _arm(self, epoch):
         if epoch > UINT32_MAX:
             raise RuntimeError("epoch exceeds 32 bits; destroy the plan and create a new one")
-        peers = [p for p in range(self.world_size) if p != self.rank]
         own = self.schedules[self.rank]
-        lane_bytes = armer.chain_bytes_by_lane(self._sdma_ep, own)
-        self._ledger.reserve(
-            self,
-            epoch,
-            {(p, queue_index(lane)): n for p in peers for lane, n in lane_bytes.items()},
-        )
+        dests = [destinations(b, self.rank, self.world_size) for b in own]
+        reserve = {}
+        for peer in range(self.world_size):
+            to_peer = [b for b, d in zip(own, dests) if peer in d]
+            for lane, n in armer.chain_bytes_by_lane(self._sdma_ep, to_peer).items():
+                reserve[(peer, queue_index(lane))] = n
+        self._ledger.reserve(self, epoch, reserve)
         self.epoch = epoch
         self.state = State.ARMED
 
@@ -228,7 +242,7 @@ class TriggeredPlan:
         try:
             for i, batch in enumerate(own):
                 gate = self.gates.data_ptr() + self.batch_id(self.rank, i) * gate_row
-                for peer in peers:
+                for peer in dests[i]:
                     copies = [
                         armer.Copy(
                             base + s.offset,

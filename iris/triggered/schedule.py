@@ -15,7 +15,7 @@ different lanes do not wait for each other. Lane 0 is the default; more lanes ne
 the Iris context.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # COPY_LINEAR's count field is 30 bits on SDMA 4.4.x
 MAX_LINEAR_BYTES = 1 << 30
@@ -50,15 +50,26 @@ class Batch:
     ``lane`` selects which of the context's ``sdma_lanes`` lanes carries the batch's chains: batches on
     one lane are released in arming order, lanes are independent of each other. A lane is not a route:
     see ``iris.triggered.queues`` for how lanes, channels and dependency classes differ.
+
+    ``peers`` lists the ranks that receive the batch; ``None`` (the default) means every other rank. A
+    batch for one rank only (scatter) or one that only the root receives (gather) sets it.
     """
 
     segments: tuple
     contributors: int = 1
     lane: int = 0
+    peers: tuple = None
 
     @property
     def is_2d(self):
         return any(s.height > 1 for s in self.segments)
+
+
+def destinations(batch, owner, world_size):
+    """The ranks that receive ``batch`` from rank ``owner``, in rank order."""
+    if batch.peers is None:
+        return tuple(r for r in range(world_size) if r != owner)
+    return tuple(sorted(batch.peers))
 
 
 def _byte_offset(view, base):
@@ -135,16 +146,38 @@ def waves(view, block_shape, num_programs, order=None, base=None):
     return batches
 
 
-def validate(schedule, buffer_bytes, lanes=1):
+def tiles(view, tile_shape, base=None, peers=None, lane=0):
+    """
+    One batch per ``tile_shape`` tile of a 2D ``view`` with unit column stride, in row-major tile order
+    (edge tiles clipped). Each tile is published once, by one program, and goes to ``peers`` (every
+    other rank by default) on ``lane``. The unit a collective's kernel releases: tile ``i`` is batch ``i``.
+    """
+    return [replace(b, peers=peers, lane=lane) for b in waves(view, tile_shape, 1, base=base)]
+
+
+def validate(schedule, buffer_bytes, lanes=1, owner=None, world_size=None):
     """
     Check every batch of ``schedule`` fits a buffer of ``buffer_bytes``, can be encoded and sits on
-    one of the ``lanes`` lanes.
+    one of the ``lanes`` lanes. With ``owner`` and ``world_size``, also check each batch's ``peers``:
+    ranks of the world other than ``owner``, no duplicates, at least one.
     """
     for i, batch in enumerate(schedule):
         if not batch.segments:
             raise ValueError(f"batch {i} has no segments")
         if batch.contributors < 1:
             raise ValueError(f"batch {i} needs at least one contributor")
+        if batch.peers is not None and world_size is not None:
+            peers = list(batch.peers)
+            bad = [
+                p
+                for p in peers
+                if not isinstance(p, int) or isinstance(p, bool) or not 0 <= p < world_size or p == owner
+            ]
+            if not peers or bad or len(set(peers)) != len(peers):
+                raise ValueError(
+                    f"batch {i}: peers {batch.peers!r} must be distinct ranks of the {world_size} rank(s) other than "
+                    f"the owner (rank {owner}), and at least one"
+                )
         if not isinstance(batch.lane, int) or isinstance(batch.lane, bool) or not 0 <= batch.lane < lanes:
             raise ValueError(
                 f"batch {i}: lane {batch.lane!r} is not one of the {lanes} lane(s) of this context "

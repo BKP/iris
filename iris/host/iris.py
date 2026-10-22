@@ -238,6 +238,18 @@ class Iris:
             self.copy_engines_device_ctx[local_rank][4] = handle.cached_wptr
             self.copy_engines_device_ctx[local_rank][5] = handle.committed_wptr
 
+    @property
+    def triggered(self):
+        """
+        Triggered collectives declared on this context, each returning a ``TriggeredPlan``:
+        ``ctx.triggered.allgather(buffer, tile_shape)``, ``.scatter(buffer, root, tile_shape)``,
+        ``.gather(buffer, root, tile_shape)``, ``.broadcast(buffer, root, tile_shape)`` and
+        ``.alltoall(buffer, tile_shape)``. Needs ``engines=("sdma",)`` and a vmem allocator.
+        """
+        from iris.triggered.collectives import Collectives
+
+        return Collectives(self)
+
     def _create_host_queues(self, src, dst):
         sdma_ep = self._sdma_ep
         if self.sdma_lanes == 1:
