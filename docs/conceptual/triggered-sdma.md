@@ -33,7 +33,7 @@ per wave of a persistent tiled kernel, such as a GEMM). Any list of batches work
 ```python
 from iris.triggered import TriggeredPlan, TriggeredView, waves
 
-ctx = iris.iris(heap_size, allocator_type="vmem_chunked")
+ctx = iris.iris(heap_size, allocator_type="vmem_chunked", engines=("sdma",))
 out = ctx.zeros(world_size * M, N, dtype=torch.bfloat16)
 schedules = [waves(out[r * M : (r + 1) * M], (BM, BN), num_programs, base=out) for r in range(world_size)]
 plan = TriggeredPlan(ctx, out, schedules)          # collective: allocates gates, arms epoch 1
@@ -104,6 +104,8 @@ after it in the same kernel is fresh (no stale elements over 9,600 tile-epochs).
 
 ## Requirements and limits
 
+- **The SDMA engine.** Create the context with `engines=("sdma",)` (needs `pip install iris[sdma]`);
+  creating a plan on a context without it raises `RuntimeError`.
 - **Stable peer mappings.** Armed chains hold peer addresses, so the heap must not re-map peers
   while chains are armed. Create the context with `allocator_type="vmem_chunked"` (or `"vmem"`):
   both keep peer addresses fixed, and the chunked allocator maps new chunks into each peer's
