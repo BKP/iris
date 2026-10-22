@@ -181,6 +181,7 @@ class SymmetricHeap:
         cur_rank: int,
         num_ranks: int,
         allocator_type: str = "torch",
+        rdma: bool = False,
     ):
         """
         Initialize symmetric heap.
@@ -190,6 +191,11 @@ class SymmetricHeap:
             device_id: GPU device ID
             cur_rank: Current process rank
             num_ranks: Total number of ranks
+            rdma: Peers on other hosts are reached with RDMA, not mapped: multi-host jobs are allowed without a
+                fabric domain, ``vmem_chunked`` is built as ONE physical chunk (so the whole heap registers with the NIC
+                as a single region; ``heap_size`` must then be a power of two), and no peer mappings are made. Every
+                rank's real heap base is kept in ``heap_bases``, so ``__translate`` yields the remote address the NIC
+                needs. Supports "torch" and "vmem_chunked".
             allocator_type: Type of allocator ("torch", "vmem", or
                 "vmem_chunked"); default "torch"
 
@@ -201,7 +207,14 @@ class SymmetricHeap:
         self.cur_rank = cur_rank
         self.num_ranks = num_ranks
         self._peer_va_ranges = {}
+        self.rdma = rdma
         allocator_type = os.environ.get("IRIS_ALLOCATOR", allocator_type).lower()
+        if rdma and allocator_type not in ("torch", "vmem_chunked"):
+            raise ValueError(f"rdma mode supports the 'torch' and 'vmem_chunked' allocators, not {allocator_type!r}")
+        if rdma and allocator_type == "vmem_chunked" and heap_size & (heap_size - 1):
+            raise ValueError(
+                f"rdma mode builds the heap as one physical chunk, which must be a power of two: got heap_size={heap_size}"
+            )
         _log_rank(
             logging.INFO,
             "SymmetricHeap: init heap_size=%.1fGB device=%d allocator=%s",
@@ -219,7 +232,7 @@ class SymmetricHeap:
         if num_ranks > 1 and not is_simulation_env():
             hostnames = _hostnames_by_rank(num_ranks)
             multi_host = len(set(hostnames)) > 1
-            if allocator_type in ("torch", "vmem"):
+            if allocator_type in ("torch", "vmem") and not rdma:
                 _require_single_host(allocator_type, hostnames)
 
         if allocator_type == "torch":
@@ -230,7 +243,8 @@ class SymmetricHeap:
             from iris.host.distributed.topology import TopologyDiscovery
 
             try:
-                topology = TopologyDiscovery().discover()
+                # RDMA mode never maps peers, so it needs no fabric domain
+                topology = None if rdma else TopologyDiscovery().discover()
             except Exception as exc:
                 if multi_host:
                     raise RuntimeError(
@@ -242,20 +256,23 @@ class SymmetricHeap:
                     exc,
                 )
                 topology = None
-            if multi_host:
+            if multi_host and not rdma:
                 _require_shared_fabric_domain(topology, cur_rank)
+            # RDMA: chunk_size == heap_size makes the heap one physical allocation, which the NIC registers whole
+            chunk_kwargs = {"chunk_size": heap_size} if rdma else {}
             self.allocator = VMemChunkedAllocator(
                 heap_size,
                 device_id,
                 cur_rank,
                 num_ranks,
                 topology=topology,
+                **chunk_kwargs,
             )
         else:
             raise ValueError(f"Unknown allocator type: {allocator_type}. Supported: 'torch', 'vmem', 'vmem_chunked'")
 
-        needs_fd_infra = True
-        if isinstance(self.allocator, VMemChunkedAllocator):
+        needs_fd_infra = not rdma  # RDMA maps no peers
+        if needs_fd_infra and isinstance(self.allocator, VMemChunkedAllocator):
             from iris.host.distributed.topology import InterconnectLevel
 
             if self.allocator.transport_tier == InterconnectLevel.INTRA_RACK_FABRIC:
@@ -369,6 +386,13 @@ class SymmetricHeap:
             self.refresh_peer_access()
 
         return tensor
+
+    def rdma_region(self):
+        """``(base address, size in bytes)`` of the range to register with the NIC: the whole heap, as one region."""
+        base = int(self.allocator.get_base_address())
+        if isinstance(self.allocator, VMemChunkedAllocator):
+            return base, self.allocator.get_num_chunks() * self.allocator.chunk_size
+        return base, self.heap_size
 
     def get_device(self) -> torch.device:
         """Get the torch device for this heap."""
@@ -535,6 +559,16 @@ class SymmetricHeap:
         self.heap_bases[self.cur_rank] = int(all_bases_arr[self.cur_rank])
 
         if self.num_ranks == 1:
+            return
+
+        if self.rdma:
+            # Nothing is mapped: every rank's real base stays in heap_bases, so translating an address gives the
+            # remote address the NIC writes to
+            for r in range(self.num_ranks):
+                self.heap_bases[r] = int(all_bases_arr[r])
+            self.heap_bases_cpu = self.heap_bases.cpu().numpy()
+            if dist.is_initialized():
+                dist.barrier()
             return
 
         # Dispatch to allocator-specific peer access path
