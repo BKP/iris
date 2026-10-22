@@ -6,6 +6,7 @@
 #
 # Every test that arms a plan aborts it on failure, so no chain is left parked on a queue.
 
+import dataclasses
 import time
 from contextlib import contextmanager
 
@@ -273,6 +274,49 @@ def test_head_of_line_order():
         assert torch.equal(buffer[:slice_elems], _expected(1, slice_elems))
         if rank != 0:
             assert (plan.gates[:, dv.G_ARRIVAL.value] == 1).all()
+    ctx.barrier()
+    del ctx
+
+
+def test_lanes_do_not_block_each_other():
+    """test_head_of_line_order's release order on two lanes: the batch released early is not held back."""
+    try:
+        ctx = iris.iris(1 << 26, allocator_type="vmem_chunked", engines=("sdma",), sdma_lanes=2)
+    except RuntimeError as exc:
+        if "update rocm-xio" in str(exc):
+            pytest.skip("rocm-xio cannot create several host channels per peer")
+        raise
+    rank, world = ctx.get_rank(), ctx.get_num_ranks()
+    if world < 2:
+        pytest.skip("triggered plans need at least two ranks")
+    slice_elems = 4096
+    half = slice_elems // 2
+    buffer = ctx.zeros(world * slice_elems, dtype=torch.int32)
+    buffer.fill_(EMPTY)
+    if rank == 0:
+        buffer[:slice_elems] = _expected(1, slice_elems)
+    early, late = chunks(buffer[:slice_elems], 2)
+    schedules = [[early, dataclasses.replace(late, lane=1)]] + [[] for _ in range(world - 1)]
+
+    with _armed(TriggeredPlan(ctx, buffer, schedules, timeout=20)) as plan:
+        assert plan.lanes == 2
+        view = plan.begin_device_epoch()
+        if rank == 0:
+            _publish_kernel[(1,)](view, 1)  # only the batch on lane 1; lane 0's batch was armed first
+        ctx.barrier()
+        if rank != 0:
+            deadline = time.monotonic() + 10
+            while plan.gates[1, dv.G_ARRIVAL.value].item() != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert plan.gates[1, dv.G_ARRIVAL.value].item() == 1
+            assert torch.equal(buffer[half:slice_elems], _expected(1, slice_elems)[half:])
+            assert plan.gates[0, dv.G_ARRIVAL.value].item() == 0
+            assert (buffer[:half] == EMPTY).all()
+        ctx.barrier()
+        if rank == 0:
+            _publish_kernel[(1,)](view, 0)
+        plan.end_device_epoch()
+        assert torch.equal(buffer[:slice_elems], _expected(1, slice_elems))
     ctx.barrier()
     del ctx
 
