@@ -42,6 +42,7 @@ R_PEERS = tl.constexpr(3)  # bit r set: rank r receives the batch (so at most 63
 
 ROLE_PUBLISH = tl.constexpr(1)
 ROLE_CONSUME = tl.constexpr(2)
+ROLE_HOST_COMPLETES = tl.constexpr(4)  # the host (not the progress kernel) marks it complete: RDMA destinations
 
 # Gate row words
 GATE_WORDS = tl.constexpr(8)

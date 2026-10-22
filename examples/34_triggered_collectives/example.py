@@ -25,6 +25,9 @@ Run it (2 or more GPUs, one rank per GPU):
     torchrun --nproc_per_node=4 --standalone example.py --collective allgather
     torchrun --nproc_per_node=4 --standalone example.py --collective scatter --root 1
     torchrun --nproc_per_node=4 --standalone example.py --collective gather --root 2
+
+Across hosts (one rank per host, mlx5 NICs): the copy engine still triggers, RDMA carries the data.
+    torchrun --nnodes=2 --nproc_per_node=1 ... example.py --rdma_device mlx5_0
 """
 
 import argparse
@@ -114,11 +117,18 @@ def main():
     parser.add_argument("--tile_rows", type=int, default=8, help="Rows per tile (tiles span the full width)")
     parser.add_argument("--epochs", type=int, default=2, help="Epochs to run (the plan re-arms between them)")
     parser.add_argument("--heap_size", type=int, default=1 << 28)
+    parser.add_argument("--rdma_device", default=None, help="Reach peers on other hosts over RDMA through this NIC")
     args = parser.parse_args()
 
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group(backend="gloo")
-    ctx = iris.iris(args.heap_size, allocator_type="vmem_chunked", engines=("sdma",))
+    if args.rdma_device is not None:
+        # The heap is registered with the NIC whole, so it must be a power of two
+        ctx = iris.iris(
+            args.heap_size, allocator_type="vmem_chunked", engines=("sdma", "rdma"), rdma_device=args.rdma_device
+        )
+    else:
+        ctx = iris.iris(args.heap_size, allocator_type="vmem_chunked", engines=("sdma",))
     rank, world = ctx.get_rank(), ctx.get_num_ranks()
     rows, cols = args.m, args.n
 

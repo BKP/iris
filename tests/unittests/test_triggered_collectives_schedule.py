@@ -169,3 +169,28 @@ def test_alltoall_sends_block_r_j_from_rank_r_to_rank_j_only():
 def test_alltoall_needs_world_squared_blocks():
     with pytest.raises(ValueError, match="evenly"):
         build(collectives.alltoall, 3, FakeTensor(6, 8), (1, 8))
+
+
+def test_view_leaves_rdma_peers_out_of_the_owners_mask_and_marks_the_batch_host_completed():
+    schedules = [[Batch((Segment(0, 64),))], [], []]  # rank 0 sends to ranks 1 and 2
+    owner = view_words(0, 3, 0x9000, schedules, host_peers={2})
+    record = dv.HEADER_WORDS.value
+    assert owner[record + dv.R_PEERS.value] == 0b010  # only rank 1: a kernel cannot read rank 2's gate
+    assert owner[record + dv.R_ROLE.value] == dv.ROLE_PUBLISH.value | dv.ROLE_HOST_COMPLETES.value
+    # the receiver behind RDMA still consumes the batch
+    receiver = view_words(2, 3, 0x9000, schedules, host_peers={0})
+    assert receiver[record + dv.R_ROLE.value] == dv.ROLE_CONSUME.value
+
+
+def test_a_batch_with_no_rdma_peer_is_not_host_completed():
+    schedules = [[Batch((Segment(0, 64),), peers=(1,))], [], []]
+    words = view_words(0, 3, 0x9000, schedules, host_peers={2})
+    assert words[dv.HEADER_WORDS.value + dv.R_ROLE.value] == dv.ROLE_PUBLISH.value
+
+
+def test_rdma_writes_split_a_segment_only_when_it_is_not_contiguous():
+    from iris.triggered.rdma import writes
+
+    assert writes(Segment(100, 64)) == [(100, 64)]
+    assert writes(Segment(0, 32, 4, 32)) == [(0, 128)]  # pitch == width: contiguous rows
+    assert writes(Segment(8, 16, 3, 64)) == [(8, 16), (72, 16), (136, 16)]

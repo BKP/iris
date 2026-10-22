@@ -34,6 +34,7 @@ from iris.host.memory.allocators.torch_allocator import TorchAllocator
 from iris.mem.triton import triggered as dv
 from iris.triggered import armer, kernels
 from iris.triggered.queues import queue_index
+from iris.triggered.rdma import RdmaKicks
 from iris.triggered.schedule import destinations, validate
 
 UINT32_MAX = (1 << 32) - 1
@@ -59,8 +60,9 @@ class BatchFailure:
     """
     One batch that did not complete in time, as this rank saw it: ``batch`` (global id), ``owner`` rank, and
     ``reason``, one of ``"unpublished"`` (the owner never released it; owner only), ``"not arrived at peers"``
-    (released, but ``peers`` have not received it; owner only) or ``"not arrived here"`` (this rank is a
-    destination and it has not arrived).
+    (released, but ``peers`` have not received it; owner only), ``"not arrived here"`` (this rank is a
+    destination and it has not arrived) or ``"send not acknowledged by the NIC"`` (an RDMA send to ``peers`` has not
+    completed).
     """
 
     batch: int
@@ -150,8 +152,12 @@ def _digest(buffer_bytes, schedules):
     return np.frombuffer(hashlib.sha256(text).digest()[:8], dtype=np.int64).copy()
 
 
-def view_words(rank, world_size, gates_ptr, schedules):
-    """The device view (see ``iris.mem.triton.triggered``) as a list of int64 words."""
+def view_words(rank, world_size, gates_ptr, schedules, host_peers=()):
+    """
+    The device view (see ``iris.mem.triton.triggered``) as a list of int64 words. ``host_peers`` are ranks reached by
+    RDMA: a kernel cannot read their gates, so they are left out of the owner's destination mask and a batch sent to
+    them is marked ``ROLE_HOST_COMPLETES`` (the host publishes its completion once the NIC acknowledged the send).
+    """
     num_batches = sum(len(s) for s in schedules)
     words = [0] * (dv.HEADER_WORDS.value + num_batches * dv.RECORD_WORDS.value)
     words[dv.H_VERSION.value] = dv.ABI_VERSION
@@ -163,8 +169,12 @@ def view_words(rank, world_size, gates_ptr, schedules):
     for owner, schedule in enumerate(schedules):
         for batch in schedule:
             peers = destinations(batch, owner, world_size)
+            mask_peers = peers
             if owner == rank:
                 role = dv.ROLE_PUBLISH.value
+                mask_peers = tuple(p for p in peers if p not in host_peers)
+                if len(mask_peers) != len(peers):
+                    role |= dv.ROLE_HOST_COMPLETES.value
             elif rank in peers:
                 role = dv.ROLE_CONSUME.value
             else:
@@ -172,7 +182,7 @@ def view_words(rank, world_size, gates_ptr, schedules):
             words[rec + dv.R_ROLE.value] = role
             words[rec + dv.R_CONTRIBUTORS.value] = batch.contributors
             words[rec + dv.R_OWNER.value] = owner
-            words[rec + dv.R_PEERS.value] = sum(1 << p for p in peers)
+            words[rec + dv.R_PEERS.value] = sum(1 << p for p in mask_peers)
             rec += dv.RECORD_WORDS.value
     return words
 
@@ -240,7 +250,12 @@ class TriggeredPlan:
         offsets = np.array([buffer.data_ptr() - heap_base, self.gates.data_ptr() - heap_base], dtype=np.int64)
         if not (distributed_allgather(offsets) == offsets).all():
             raise RuntimeError("buffer or gates sit at different heap offsets on different ranks")
-        words = view_words(self.rank, self.world_size, self.gates.data_ptr(), self.schedules)
+        # Peers on other hosts are reached by RDMA (the context's rdma engine), the rest by copy-engine chains
+        self._rdma_peers = frozenset(ctx._rdma_endpoints)
+        uses_rdma = bool(distributed_allgather(np.array([int(bool(self._rdma_peers))], dtype=np.int64)).any())
+        words = view_words(
+            self.rank, self.world_size, self.gates.data_ptr(), self.schedules, host_peers=self._rdma_peers
+        )
         self.view = torch.tensor(words, dtype=torch.int64, device=buffer.device)
         self._own = torch.arange(
             self._first[self.rank], self._first[self.rank + 1], dtype=torch.int64, device=buffer.device
@@ -249,6 +264,7 @@ class TriggeredPlan:
         self._missing = torch.zeros(self.num_batches, dtype=torch.int64, device=buffer.device)
         self.failures = []
         self._ledger = ledger(ctx)
+        self._rdma = RdmaKicks(self, self._rdma_peers) if uses_rdma else None
         self.epoch = 0
         self._arm(1)
         ctx.barrier()
@@ -264,9 +280,14 @@ class TriggeredPlan:
         dests = [destinations(b, self.rank, self.world_size) for b in own]
         reserve = {}
         for peer in range(self.world_size):
+            if peer in self._rdma_peers:
+                continue
             to_peer = [b for b, d in zip(own, dests) if peer in d]
             for lane, n in armer.chain_bytes_by_lane(self._sdma_ep, to_peer).items():
                 reserve[(peer, queue_index(lane))] = n
+        if self._rdma is not None:
+            for key, n in self._rdma.reserve_bytes().items():
+                reserve[key] = reserve.get(key, 0) + n
         self._ledger.reserve(self, epoch, reserve)
         self.epoch = epoch
         self.state = State.ARMED
@@ -279,6 +300,8 @@ class TriggeredPlan:
             for i, batch in enumerate(own):
                 gate = self.gates.data_ptr() + self.batch_id(self.rank, i) * gate_row
                 for peer in dests[i]:
+                    if peer in self._rdma_peers:
+                        continue
                     copies = [
                         armer.Copy(
                             base + s.offset,
@@ -301,6 +324,8 @@ class TriggeredPlan:
                         batch.is_2d,
                         channel=queue_index(batch.lane),
                     )
+            if self._rdma is not None:
+                self._rdma.arm(self.epoch)
         except Exception:
             # Chains armed so far stay parked: abort() releases them
             self.state = State.FAILED
@@ -337,12 +362,17 @@ class TriggeredPlan:
             status = self._status.cpu()
             mine = slice(self._first[self.rank], self._first[self.rank + 1])
             pending = ((status[mine] if own_only else status) & done) == 0
-            if not pending.any():
+            sent = self._rdma.poll() if self._rdma is not None else True
+            if not pending.any() and sent:
+                if self._rdma is not None:
+                    self._rdma.mark_complete(self.gates, self.epoch)
                 return
             if time.monotonic() > deadline:
                 first = mine.start if own_only else 0
                 ids = (pending.nonzero().flatten() + first).tolist()
-                self._fail(ids, status, self._missing.cpu())
+                if ids:
+                    self._fail(ids, status, self._missing.cpu())
+                self._fail_unacknowledged()
 
     def _fail(self, ids, status, missing):
         """Record why each batch in ``ids`` is incomplete, flag it in its gate's error word, and raise."""
@@ -358,6 +388,17 @@ class TriggeredPlan:
                 peers = tuple(r for r in range(self.world_size) if absent >> r & 1)
                 failures.append(BatchFailure(b, owner, "not arrived at peers", peers))
         self.gates[torch.tensor(ids, device=self.gates.device), dv.G_ERROR.value] = self.epoch
+        self.failures = failures
+        raise PlanError(self.epoch, failures)
+
+    def _fail_unacknowledged(self):
+        """Every batch is done on the kernel's side but the NIC has not acknowledged all RDMA sends: flag and raise."""
+        ids = list(self._rdma.host_batches)
+        failures = [
+            BatchFailure(b, self.rank, "send not acknowledged by the NIC", tuple(sorted(self._rdma_peers))) for b in ids
+        ]
+        if ids:
+            self.gates[torch.tensor(ids, device=self.gates.device), dv.G_ERROR.value] = self.epoch
         self.failures = failures
         raise PlanError(self.epoch, failures)
 
@@ -408,4 +449,5 @@ class TriggeredPlan:
             raise RuntimeError(f"plan is {self.state.value}; abort() it before destroying")
         self._ledger.release(self)
         self.state = State.DESTROYED
+        self._rdma = None
         self.gates = self.view = self.buffer = None

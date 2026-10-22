@@ -46,6 +46,27 @@ fetch-add; `rdma_put_signal` is a write followed, on the same queue pair, by an 
 sees the flag sees the data (a Triton kernel on the peer polls the flag with an acquire atomic). The lower level is
 `iris.device.rdma_utils` (`put`, `atomic_add`, `quiet`, `poll_cq`).
 
+## Triggered plans over RDMA
+
+A `TriggeredPlan` (see [triggered SDMA](triggered-sdma.md)) can send to a peer on another host: create the context with
+`engines=("sdma", "rdma")` and use the plan, or the collectives, as usual. For each batch and each remote peer the host
+posts the batch's RDMA writes **dormant** into a dedicated queue pair (one per peer and lane, queues in GPU memory), then
+a write of the epoch into the peer's arrival gate, and arms a copy-engine chain: wait for the batch's ready gate, then
+write the send queue's doorbell record and the NIC's doorbell. `publish` in the producer kernel opens the gate and the
+copy engine rings the NIC; no CPU is involved while the epoch runs. The receiving side is unchanged: it waits on its own
+arrival gate.
+
+- The arrival gate has exactly one writer per epoch, so the epoch is **written**; a design with several writers into one
+  gate would need an atomic add.
+- A rank learns that a batch it sent to an RDMA peer is done from the completion the NIC posts once the peer acknowledged
+  the data and the arrival write. The host polls those in `end_device_epoch()`, then marks the batch complete, so
+  `reusable(batch)` on the sending rank becomes true then (not before the host call).
+- A triggered queue pair holds 1,024 work requests and 512 completions per epoch: a batch of S contiguous segments takes
+  S + 1 slots and one completion (a strided segment takes one slot per row). Plans that need more are refused at creation.
+- The work requests are written by the CPU into GPU memory; Iris drains those writes to the device before arming any
+  chain that can ring the doorbell.
+- Limits: `mlx5` and InfiniBand, and one rank per host, so every peer is reached over RDMA.
+
 ## Things to know
 
 - Use `dist.barrier()`, not `ctx.barrier()`, while a kernel is spinning for a signal: `ctx.barrier()` first waits for

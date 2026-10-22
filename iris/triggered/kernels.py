@@ -18,6 +18,7 @@ from iris.mem.triton.triggered import (
     R_ROLE,
     RECORD_WORDS,
     ROLE_CONSUME,
+    ROLE_HOST_COMPLETES,
     TriggeredView,
 )
 
@@ -62,7 +63,9 @@ def progress_kernel(
     record = view + HEADER_WORDS + batch * RECORD_WORDS
     own = tl.load(record + R_OWNER) == tv.rank
     destinations = tl.load(record + R_PEERS)
-    consume = (tl.load(record + R_ROLE) & ROLE_CONSUME) != 0
+    role = tl.load(record + R_ROLE)
+    consume = (role & ROLE_CONSUME) != 0
+    host_completes = (role & ROLE_HOST_COMPLETES) != 0
     done = tl.full((), True, tl.int1)
     flags = tl.full((), 0, tl.int32)
     absent = tl.full((), 0, tl.int64)
@@ -79,7 +82,7 @@ def progress_kernel(
         if consume:
             done = _reached(gate + G_ARRIVAL, tv.epoch, BUDGET)
             flags = tl.where(done, 0, STATUS_NOT_HERE)
-    if done:
+    if done & (~host_completes):
         tl.atomic_xchg(gate + G_COMPLETION, tv.epoch, sem="release", scope="sys")
     tl.store(status + batch, flags | done.to(tl.int32))
     tl.store(missing + batch, absent)
