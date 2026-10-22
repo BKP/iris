@@ -32,3 +32,13 @@ def test_default_context_rejects_host_sdma():
         shmem.put(buffer, to_rank=peer)
     with pytest.raises(RuntimeError, match=r"engines=\(\"sdma\",\)"):
         shmem.quiet()
+
+
+def test_default_context_rejects_triggered_plan():
+    from iris.triggered import TriggeredPlan
+
+    shmem = iris.iris(1 << 20)
+    buffer = shmem.zeros(16, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match=r"engines=\(\"sdma\",\)"):
+        TriggeredPlan(shmem, buffer, [[]] * shmem.get_num_ranks())

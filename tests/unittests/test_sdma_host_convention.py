@@ -45,6 +45,7 @@ def make_ctx():
     ctx = SimpleNamespace(
         get_rank=lambda: 0,
         _require_copy_engine=lambda: ep,
+        _check_host_queue_idle=lambda rank: None,
         heap=SimpleNamespace(translate=lambda ptr, src_rank, dst_rank: ptr + REMOTE),
     )
     ctx._flag_pointer_and_bits = lambda flag, **kw: Iris._flag_pointer_and_bits(ctx, flag, **kw)
@@ -93,6 +94,32 @@ def test_put_tiles_takes_raw_arguments():
             (0, 1, 0, [DST, DST + 64], [SRC, SRC + 64], 4, [8, 4], [16, 8], [128, 128], [64, 64]),
         )
     ]
+
+
+def assert_refused_while_triggered_chains_are_armed(call):
+    ctx, ep = make_ctx()
+
+    def busy(rank):
+        raise RuntimeError(f"triggered chains are armed on the copy-engine queue to rank {rank}")
+
+    ctx._check_host_queue_idle = busy
+    with pytest.raises(RuntimeError, match="triggered chains are armed"):
+        call(ctx)
+    assert ep.calls == []
+
+
+def test_put_refuses_a_peer_with_armed_triggered_chains():
+    assert_refused_while_triggered_chains_are_armed(lambda ctx: Iris.put(ctx, FakeTensor(SRC, 256), to_rank=1))
+
+
+def test_put_tile_refuses_a_peer_with_armed_triggered_chains():
+    assert_refused_while_triggered_chains_are_armed(lambda ctx: Iris.put_tile(ctx, SRC, 1, DST, 4, 8, 16, 64, 128))
+
+
+def test_put_tiles_refuses_a_peer_with_armed_triggered_chains():
+    assert_refused_while_triggered_chains_are_armed(
+        lambda ctx: Iris.put_tiles(ctx, [SRC], 1, [DST], 4, [8], [16], [64], [128])
+    )
 
 
 def test_put_tiles_rejects_mismatched_lengths():

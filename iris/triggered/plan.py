@@ -88,10 +88,8 @@ class _QueueLedger:
 
 def ledger(ctx):
     if getattr(ctx, "_triggered_ledger", None) is None:
-        from xio import sdma_ep
-
         # Leave half the ring for wrap padding and work queued before the plan
-        ctx._triggered_ledger = _QueueLedger(sdma_ep.SDMA_QUEUE_SIZE // 2)
+        ctx._triggered_ledger = _QueueLedger(ctx._require_copy_engine().SDMA_QUEUE_SIZE // 2)
     return ctx._triggered_ledger
 
 
@@ -139,6 +137,7 @@ class TriggeredPlan:
 
     def __init__(self, ctx, buffer, schedules, timeout=30.0):
         self.ctx = ctx
+        self._sdma_ep = ctx._require_copy_engine()
         self.rank = ctx.get_rank()
         self.world_size = ctx.get_num_ranks()
         self.timeout = timeout
@@ -192,7 +191,7 @@ class TriggeredPlan:
             raise RuntimeError("epoch exceeds 32 bits; destroy the plan and create a new one")
         peers = [p for p in range(self.world_size) if p != self.rank]
         own = self.schedules[self.rank]
-        nbytes = sum(armer.chain_bytes(b) for b in own)
+        nbytes = sum(armer.chain_bytes(self._sdma_ep, b) for b in own)
         self._ledger.reserve(self, epoch, {p: nbytes for p in peers})
         self.epoch = epoch
         self.state = State.ARMED
@@ -216,7 +215,7 @@ class TriggeredPlan:
                         for s in batch.segments
                     ]
                     arrival = heap.translate(gate + 8 * dv.G_ARRIVAL.value, self.rank, peer)
-                    armer.arm_chain(self.rank, peer, gate, self.epoch, copies, arrival, batch.is_2d)
+                    armer.arm_chain(self._sdma_ep, self.rank, peer, gate, self.epoch, copies, arrival, batch.is_2d)
         except Exception:
             # Chains armed so far stay parked: abort() releases them
             self.state = State.FAILED
